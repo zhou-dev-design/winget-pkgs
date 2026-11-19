@@ -25,6 +25,12 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
+# 参数传错时（例如把 -OpenPr 当成位置参数绑给了 RepoRoot）在这里立刻炸掉，
+# 而不是一路"找不到包"到静默跳过。
+if (-not (Test-Path (Join-Path $RepoRoot '.git'))) {
+    throw "RepoRoot 不像一个 git 仓库目录：'$RepoRoot'（检查参数有没有按位置传错）"
+}
+
 $script:Upstream = 'microsoft/winget-pkgs'
 $script:Token = $env:GITHUB_TOKEN
 $script:UpstreamSha = $null
