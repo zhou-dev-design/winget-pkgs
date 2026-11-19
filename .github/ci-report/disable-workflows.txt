@@ -1,0 +1,24 @@
+repo: zhou-dev-design/winget-pkgs
+run: 44491409411
+date: 2026-11-19T08:53:15Z
+==== disable 返回码 ====
+204	domain-validation-assist.lock.yml
+204	elevation-requirement-review.lock.yml
+204	label-reconciliation-assist.lock.yml
+204	manifest-metadata-review.lock.yml
+204	manifest-validation-diagnosis.lock.yml
+204	missing-dependency-assist.lock.yml
+204	pesterTests.yaml
+204	scriptAnalyzer.yaml
+204	spellCheck.yaml
+204	transient-security-explanation.lock.yml
+204	unattended-artifact-triage.lock.yml
+204	wingetbot-pr-triage.lock.yml
+active	.github/workflows/bump-winget.yml
+disabled_manually	.github/workflows/domain-validation-assist.lock.yml
+disabled_manually	.github/workflows/elevation-requirement-review.lock.yml
+disabled_manually	.github/workflows/label-reconciliation-assist.lock.yml
+disabled_manually	.github/workflows/manifest-metadata-review.lock.yml
+disabled_manually	.github/workflows/manifest-validation-diagnosis.lock.yml
+disabled_manually	.github/workflows/missing-dependency-assist.lock.yml
+disabled_manually	.github/workflows/pesterTests.yaml
