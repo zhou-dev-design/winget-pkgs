@@ -44,7 +44,8 @@ function Test-VersionName([string]$name) { $name -match '\d' -and $name -notmatc
 
 function Get-Json([string]$uri) {
     $h = @{ 'User-Agent' = 'winget-bump'; 'Accept' = 'application/vnd.github+json' }
-    if ($script:Token) { $h['Authorization'] = "Bearer $script:Token" }
+    # token 只发给 GitHub API，别把 Actions 凭据漏给 code.visualstudio.com 之类的第三方
+    if ($script:Token -and $uri -like 'https://api.github.com/*') { $h['Authorization'] = "Bearer $script:Token" }
     $r = Invoke-RestMethod -Uri $uri -Headers $h -TimeoutSec 90
     if ($null -eq $r) { return }
     # Invoke-RestMethod 不枚举顶层数组，不摊平会被当成一个元素
