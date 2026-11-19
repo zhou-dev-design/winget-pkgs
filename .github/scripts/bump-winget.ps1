@@ -32,7 +32,19 @@ if (-not (Test-Path (Join-Path $RepoRoot '.git'))) {
 }
 
 $script:Upstream = 'microsoft/winget-pkgs'
-$script:Token = $env:GITHUB_TOKEN
+
+# token 里混进空格/换行会让 HTTP 头非法，GitHub 只会回一句
+# "The format of value '***' is invalid"（值还被他们打了码，很难查）。
+# 粘贴 secret 时尾随空白非常常见：40 位的 classic token 会变成 41 位。统一清一遍。
+function ConvertTo-CleanToken([string]$v) {
+    if (-not $v) { return $null }
+    $t = $v -replace '\s', ''
+    if ($t -match '^(?i)bearer(.+)$') { $t = $matches[1] }
+    return $t
+}
+$script:Token = ConvertTo-CleanToken $env:GITHUB_TOKEN
+$script:PAT = ConvertTo-CleanToken $env:GH_TOKEN
+$script:PatTrimmedFrom = if ($env:GH_TOKEN -and $env:GH_TOKEN.Length -ne $script:PAT.Length) { $env:GH_TOKEN.Length } else { 0 }
 $script:UpstreamSha = $null
 
 function Write-Head([string]$t) { Write-Host "`n== $t" }
@@ -132,7 +144,7 @@ function Get-BaseDir([string]$Id, [string]$Base) {
             Write-Dim "  raw 取不到（$($_.Exception.Message)），改用 API"
         }
         if (-not $ok) {
-            $tok = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $script:Token }
+            $tok = if ($script:PAT) { $script:PAT } else { $script:Token }
             $hdrs = @{ 'User-Agent' = 'winget-bump'; 'Accept' = 'application/vnd.github+json' }
             if ($tok) { $hdrs['Authorization'] = "Bearer $tok" }
             $j = Invoke-RestMethod -Uri $it.url -Headers $hdrs -TimeoutSec 60
@@ -370,11 +382,11 @@ function Get-GitHubRelease($pkg) {
 
 function Invoke-GhApi {
     param([string]$Method, [string]$Path, $Body)
-    if (-not $env:GH_TOKEN) { throw '需要 GH_TOKEN 才能调用写接口' }
+    if (-not $script:PAT) { throw '需要 GH_TOKEN 才能调用写接口' }
     $h = @{
         'User-Agent'           = 'winget-bump'
         'Accept'               = 'application/vnd.github+json'
-        'Authorization'        = "Bearer $($env:GH_TOKEN)"
+        'Authorization'        = "Bearer $($script:PAT)"
         'X-GitHub-Api-Version' = '2022-11-28'
     }
     $req = @{ Uri = "https://api.github.com$Path"; Headers = $h; Method = $Method; TimeoutSec = 90 }
@@ -559,14 +571,17 @@ foreach ($b in $bumped) {
 $prOpened = @()
 if ($OpenPr) {
     Write-Head '向上游开 PR'
-    if (-not $env:GH_TOKEN -and -not $DryRun) {
+    if (-not $script:PAT -and -not $DryRun) {
         Write-Warn2 '没有 GH_TOKEN：跳过自动开 PR（在仓库 Secrets 里加 GH_TOKEN 即可）'
         # 让它出现在 Actions 的"说明"面板里，而不是埋在日志深处
         Write-Host '::warning title=GH_TOKEN 未配置::去 Settings → Secrets and variables → Actions 加一个名为 GH_TOKEN 的 secret（classic PAT，勾 public_repo），然后重新运行'
-    } elseif ($env:GH_TOKEN -and $env:GH_TOKEN.StartsWith('github_pat_')) {
+    } elseif ($script:PAT -and $script:PAT.StartsWith('github_pat_')) {
         Write-Warn2 'GH_TOKEN 是 fine-grained token，不能向上游开 PR'
         Write-Host '::warning title=GH_TOKEN 类型不对::fine-grained token 无法向「你不是成员的公共仓库」提交；请换成 classic PAT 并勾 public_repo'
     } else {
+        if ($script:PatTrimmedFrom) {
+            Write-Warn2 "GH_TOKEN 里带了空白字符（$($script:PatTrimmedFrom) → $($script:PAT.Length) 位），已自动清掉；建议把 secret 重新粘一次"
+        }
         foreach ($pkg in $packages) {
             if ($Only -and $Only -ne $pkg.Id) { continue }
             try {
