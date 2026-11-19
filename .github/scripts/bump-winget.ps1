@@ -59,6 +59,13 @@ function Get-Json([string]$uri) {
     foreach ($x in $r) { $x }
 }
 
+function Get-ForkRepo {
+    if ($env:GITHUB_REPOSITORY) { return $env:GITHUB_REPOSITORY }
+    $url = (& git -C $RepoRoot remote get-url origin 2>$null | Out-String).Trim()
+    if ($url -match '[/:]([^/:]+)/([^/]+?)(?:\.git)?$') { return "$($matches[1])/$($matches[2])" }
+    throw '拿不到 fork 仓库名'
+}
+
 function Get-IdParts([string]$id) {
     $i = $id.IndexOf('.')
     [pscustomobject]@{
@@ -70,9 +77,65 @@ function Get-IdParts([string]$id) {
 function Get-RepoVersions([string]$id) {
     $p = Get-IdParts $id
     $dir = Join-Path $RepoRoot $p.RelPath
-    if (-not (Test-Path $dir)) { return @() }
-    Sort-Versions (@(Get-ChildItem -LiteralPath $dir -Directory |
-                     Where-Object { Test-VersionName $_.Name } | ForEach-Object { $_.Name }))
+    if (Test-Path $dir) {
+        $v = @(Get-ChildItem -LiteralPath $dir -Directory |
+               Where-Object { Test-VersionName $_.Name } | ForEach-Object { $_.Name })
+        if ($v) { return Sort-Versions $v }
+    }
+    # 工作区里没有这个目录：这个大仓库的稀疏检出并不总是生效（实测 .github/scripts 检出了、
+    # manifests/ 没检出），所以退回到直接问 fork 的 API，别让检出状态决定能不能发版。
+    try {
+        $fork = Get-ForkRepo
+        $items = @(Get-Json "https://api.github.com/repos/$fork/contents/$($p.RelPath)?ref=master")
+        $v = @($items | Where-Object { $_.type -eq 'dir' -and (Test-VersionName $_.name) } | ForEach-Object { $_.name })
+        if ($v) { Write-Dim "（工作区缺 $($p.RelPath)，版本表改用 API）" }
+        return Sort-Versions $v
+    } catch {
+        Write-Warn2 "读 fork 版本失败：$($_.Exception.Message)"
+        return @()
+    }
+}
+
+# 取基底清单所在的目录。工作区里有就用；没有就按 fork 的 raw 地址下载到临时目录。
+# 返回的目录可能不在仓库里，调用方只做"读 + 复制"。
+function Get-BaseDir([string]$Id, [string]$Base) {
+    $p = Get-IdParts $Id
+    $local = Join-Path $RepoRoot "$($p.RelPath)/$Base"
+    if ((Test-Path $local) -and (Get-ChildItem -LiteralPath $local -File -ErrorAction SilentlyContinue)) {
+        return $local
+    }
+
+    $fork = Get-ForkRepo
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("wg-base-" + ($Id -replace '[^\w]', '_') + "-$Base")
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Write-Dim "工作区里没有 $($p.RelPath)/$Base，从 $fork 下载"
+
+    # 注意 $Base 后面必须用 $()：直接写 $Base?ref 会被当成变量名 "Base?ref"
+    $items = @(Get-Json "https://api.github.com/repos/$fork/contents/$($p.RelPath)/$($Base)?ref=master")
+    foreach ($it in $items) {
+        if ($it.type -ne 'file') { continue }
+        $dest = Join-Path $tmp $it.name
+        $ok = $false
+        try {
+            # 先走 CDN，快；不通再退回 API 的 base64 内容
+            $u = "https://raw.githubusercontent.com/$fork/master/$($p.RelPath)/$Base/$($it.name)"
+            Invoke-WebRequest -Uri $u -OutFile $dest -TimeoutSec 60
+            $ok = $true
+        } catch {
+            Write-Dim "  raw 取不到（$($_.Exception.Message)），改用 API"
+        }
+        if (-not $ok) {
+            $tok = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $script:Token }
+            $hdrs = @{ 'User-Agent' = 'winget-bump'; 'Accept' = 'application/vnd.github+json' }
+            if ($tok) { $hdrs['Authorization'] = "Bearer $tok" }
+            $j = Invoke-RestMethod -Uri $it.url -Headers $hdrs -TimeoutSec 60
+            Save-Manifest $dest ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($j.content)))
+        }
+        Write-Dim "  $($it.name)"
+    }
+    if (-not (Get-ChildItem -LiteralPath $tmp -File)) { throw "下载基底失败：$($p.RelPath)/$Base" }
+    $tmp
 }
 
 # ---------------------------------------------------------------- 清单改写
@@ -194,7 +257,7 @@ function New-VersionFromBase {
     param([string]$Id, [string]$Base, [string]$Version, $Specs, [string]$ReleaseDate)
 
     $p = Get-IdParts $Id
-    $baseDir = Join-Path $RepoRoot "$($p.RelPath)/$Base"
+    $baseDir = Get-BaseDir $Id $Base
     if (-not (Test-Path $baseDir)) { throw "基底目录不存在：$baseDir" }
 
     $dest = Join-Path $RepoRoot "$($p.RelPath)/$Version"
@@ -332,13 +395,6 @@ function Get-OpenPrCount([string]$Id, [string]$Version) {
     } catch { return 0 }
 }
 
-function Get-ForkRepo {
-    if ($env:GITHUB_REPOSITORY) { return $env:GITHUB_REPOSITORY }
-    $url = (& git -C $RepoRoot remote get-url origin | Out-String).Trim()
-    if ($url -match '[/:]([^/:]+)/([^/]+?)(?:\.git)?$') { return "$($matches[1])/$($matches[2])" }
-    throw '拿不到 fork 仓库名'
-}
-
 function New-PrBody([string]$Id, [string]$Version, $Specs) {
     $links = (@($Specs) | Where-Object { $_.Url } | ForEach-Object { "- ``$($_.Arch)/$($_.Scope)`` $($_.Url)" }) -join "`n"
     @"
@@ -470,7 +526,8 @@ foreach ($pkg in $packages) {
 foreach ($b in $bumped) {
     $msg = "New version: $($b.Id) version $($b.Version)"
     if ($DryRun) { Write-Dim "DryRun：git add $($b.RelPath)  /  commit -m `"$msg`""; continue }
-    & git -C $RepoRoot add -- $b.RelPath
+    # --sparse：稀疏检出下，落在稀疏范围外的路径 git add 会静默跳过
+    & git -C $RepoRoot add --sparse -- $b.RelPath
     if ($LASTEXITCODE -ne 0) { throw "git add 失败：$($b.RelPath)" }
 
     # 安全网：仓库有上百万个文件，万一稀疏检出把索引搞没了，暂存区会出现海量删除
@@ -479,6 +536,11 @@ foreach ($b in $bumped) {
     if ($dels.Count -gt 0) {
         & git -C $RepoRoot reset -q
         throw "暂存区出现 $($dels.Count) 个删除（如 $($dels[0])），疑似稀疏检出丢了索引，已中止"
+    }
+
+    if (@(& git -C $RepoRoot diff --cached --name-only).Count -eq 0) {
+        Write-Ok "与仓库里已有内容一致，无需提交：$($b.RelPath)"
+        continue
     }
 
     & git -C $RepoRoot commit -q -m $msg
