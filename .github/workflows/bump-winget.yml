@@ -32,6 +32,7 @@ jobs:
           sparse-checkout: |
             manifests/m/Microsoft/VisualStudioCode
             manifests/d/DeepSeek/DeepSeekHarnessDesktop
+            .github/scripts
 
       - name: 探测新版本并生成清单
         shell: pwsh
