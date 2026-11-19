@@ -17,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $script:Upstream = 'microsoft/winget-pkgs'
@@ -242,6 +243,23 @@ function Get-VsCodeRelease {
     }
 }
 
+# 下载安装包算 SHA256（带重试）；文件不在就返回 $null，调用方按"等上传"处理
+function Get-UrlSha256([string]$url) {
+    for ($try = 1; $try -le 3; $try++) {
+        try {
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) "dl-$([guid]::NewGuid().ToString('N')).bin"
+            Invoke-WebRequest -Uri $url -OutFile $tmp -TimeoutSec 3600
+            $sha = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            return $sha
+        } catch {
+            Write-Warn2 "下载失败（第 $try 次）：$($_.Exception.Message)"
+            Start-Sleep -Seconds 10
+        }
+    }
+    return $null
+}
+
 function Get-GitHubRelease($pkg) {
     $raw = @(Get-Json "https://api.github.com/repos/$($pkg.GitHub)/releases?per_page=10")
     $rel = @($raw | Where-Object { -not $_.draft })
@@ -257,20 +275,11 @@ function Get-GitHubRelease($pkg) {
         $head = $null
         try { $head = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 60 } catch { }
         if (-not $head) { return [pscustomobject]@{ Version = $ver; Pending = $url } }
-        $sha = $null
-        for ($try = 1; $try -le 3 -and -not $sha; $try++) {
-            try {
-                $tmp = Join-Path ([IO.Path]::GetTempPath()) "dl-$([guid]::NewGuid().ToString('N')).bin"
-                Invoke-WebRequest -Uri $url -OutFile $tmp -TimeoutSec 3600
-                $sha = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
-                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-            } catch { Write-Warn2 "下载失败（第 $try 次）：$($_.Exception.Message)"; Start-Sleep -Seconds 10 }
-        }
-        if (-not $sha) { return [pscustomobject]@{ Version = $ver; Pending = $url } }
 
         $arch = ($sel -split '@')[0]
         $scope = if ($sel -match '@') { ($sel -split '@')[1] } else { '' }
-        $specs += [pscustomobject]@{ Arch = $arch; Scope = $scope; Type = ''; Url = $url; Sha256 = $sha }
+        # 哈希先不算：286MB 不能每小时都下一遍，等确认要发版了再下
+        $specs += [pscustomobject]@{ Arch = $arch; Scope = $scope; Type = ''; Url = $url; Sha256 = $null }
     }
     [pscustomobject]@{
         Version     = $ver
@@ -317,6 +326,17 @@ foreach ($pkg in $packages) {
 
         if ($have -and (Get-NatKey $rel.Version) -le (Get-NatKey $have)) { Write-Ok '已是最新'; continue }
         if (-not $have) { Write-Warn2 "仓库里没有这个包，先手工放一份基底再自动跟版本"; continue }
+
+        # 确认要发版了，才去下载安装包算哈希
+        $missing = $false
+        foreach ($sp in $rel.Specs) {
+            if ($sp.Sha256) { continue }
+            if ($DryRun) { Write-Dim "DryRun：跳过哈希计算 $($sp.Url)"; continue }
+            Write-Dim "下载并计算哈希：$($sp.Url)"
+            $sp.Sha256 = Get-UrlSha256 $sp.Url
+            if (-not $sp.Sha256) { Write-Warn2 "文件取不到，本轮跳过：$($sp.Url)"; $missing = $true }
+        }
+        if ($missing) { continue }
 
         $relPath = New-VersionFromBase -Id $pkg.Id -Base $have -Version $rel.Version -Specs $rel.Specs -ReleaseDate $rel.ReleaseDate
         if (-not (Test-Manifest $pkg.Id $rel.Version)) { throw "validate 没过，不提交" }
