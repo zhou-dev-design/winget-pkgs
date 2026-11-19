@@ -1,5 +1,5 @@
 # 只跟两个包的 winget 清单：Microsoft.VisualStudioCode（stable）和 DeepSeek.DeepSeekHarnessDesktop
-# 每小时跑一次；有新版本就生成清单 → winget validate → 提交到 master → 顺手向上游开 PR
+# 每 15 分钟一轮；有新版本就生成清单 → winget validate → 提交到 master → 顺手向上游开 PR
 #
 # 需要的 secret：GH_TOKEN —— classic PAT，勾 public_repo
 #   （fine-grained 不行：GitHub 不允许 fine-grained token 向非成员公共仓库提交内容，
@@ -13,7 +13,9 @@ name: bump winget manifests
 
 on:
   schedule:
-    - cron: '17 * * * *'        # UTC 每小时 17 分（整点排队最挤）
+    # 每 15 分钟一轮（GitHub 最短间隔是 5 分钟，这里留足余量）
+    # 注意：定时触发普遍会延迟几分钟，高峰期也可能被跳过某一轮，所以别指望精确到秒
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 permissions:
