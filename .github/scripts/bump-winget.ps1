@@ -3,8 +3,12 @@
 ci-bump.ps1 —— 在 GitHub Actions 里跑：只跟 VS Code 和 DeepSeek Harness 两个包
 
 工作目录是仓库根（checkout 出来的那份）。有新版本才动文件，没变化不产生提交。
+给了 -OpenPr 且环境里有 GH_TOKEN 时，顺带从上游 master 起一个只含清单的分支，
+并向上游开 PR（分支里的 .github 改动不会带过去）。
+
 环境变量：
   GITHUB_TOKEN  可选，用于提高 GitHub API 限额（Actions 里自带）
+  GH_TOKEN      可选，有权限对 microsoft/winget-pkgs 开 PR 的 PAT；没给就只打印人工开 PR 的链接
   REPO_ROOT     仓库根，默认当前目录
 
 退出码：0 一切正常（含"没有新版本"）；非 0 表示出错，工作流会标红。
@@ -13,6 +17,7 @@ ci-bump.ps1 —— 在 GitHub Actions 里跑：只跟 VS Code 和 DeepSeek Harne
 param(
     [string]$RepoRoot = $(if ($env:REPO_ROOT) { $env:REPO_ROOT } else { (Get-Location).Path }),
     [string]$Only,
+    [switch]$OpenPr,
     [switch]$DryRun
 )
 
@@ -22,6 +27,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $script:Upstream = 'microsoft/winget-pkgs'
 $script:Token = $env:GITHUB_TOKEN
+$script:UpstreamSha = $null
 
 function Write-Head([string]$t) { Write-Host "`n== $t" }
 function Write-Ok([string]$t) { Write-Host "  [ok] $t" }
@@ -288,6 +294,119 @@ function Get-GitHubRelease($pkg) {
     }
 }
 
+# ---------------------------------------------------------------- 向上游开 PR
+# 走 GitHub API 在服务端建分支和提交。为什么不在本地开分支：PR 分支的父提交必须是
+# 上游最新的 master，而那个提交 fork 里没有——本地 shallow 仓库推它会被
+# "shallow update not allowed" 拒掉。
+
+function Invoke-GhApi {
+    param([string]$Method, [string]$Path, $Body)
+    if (-not $env:GH_TOKEN) { throw '需要 GH_TOKEN 才能调用写接口' }
+    $h = @{
+        'User-Agent'           = 'winget-bump'
+        'Accept'               = 'application/vnd.github+json'
+        'Authorization'        = "Bearer $($env:GH_TOKEN)"
+        'X-GitHub-Api-Version' = '2022-11-28'
+    }
+    $req = @{ Uri = "https://api.github.com$Path"; Headers = $h; Method = $Method; TimeoutSec = 90 }
+    if ($null -ne $Body) {
+        $req['Body'] = ($Body | ConvertTo-Json -Depth 8 -Compress)
+        $req['ContentType'] = 'application/json'
+    }
+    Invoke-RestMethod @req
+}
+
+function Test-UpstreamHasVersion([string]$Id, [string]$Version) {
+    $p = Get-IdParts $Id
+    try { $null = Get-Json "https://api.github.com/repos/$($script:Upstream)/contents/$($p.RelPath)/$Version" }
+    catch { return $false }
+    return $true
+}
+
+# 同一个"包 + 版本"已经有开着的 PR 就别再开（上游允许不同版本同时开着）
+function Get-OpenPrCount([string]$Id, [string]$Version) {
+    try {
+        $q = "repo:$($script:Upstream)+is:pr+is:open+in:title+%22$Id+version+$Version%22"
+        $r = Get-Json "https://api.github.com/search/issues?q=$q&per_page=1"
+        return [int]$r.total_count
+    } catch { return 0 }
+}
+
+function Get-ForkRepo {
+    if ($env:GITHUB_REPOSITORY) { return $env:GITHUB_REPOSITORY }
+    $url = (& git -C $RepoRoot remote get-url origin | Out-String).Trim()
+    if ($url -match '[/:]([^/:]+)/([^/]+?)(?:\.git)?$') { return "$($matches[1])/$($matches[2])" }
+    throw '拿不到 fork 仓库名'
+}
+
+function New-PrBody([string]$Id, [string]$Version, $Specs) {
+    $links = (@($Specs) | Where-Object { $_.Url } | ForEach-Object { "- ``$($_.Arch)/$($_.Scope)`` $($_.Url)" }) -join "`n"
+    @"
+## 📖 Description
+
+Bump ``$Id`` to ``$Version``.
+
+Installers (URL and SHA256 taken from the official source and verified in CI):
+
+$links
+
+## ✅ Checklist
+
+- [x] Signed the Contributor License Agreement
+- [ ] Linked to an issue (if applicable)
+
+## 📦 Manifest Checklist
+
+- [x] Checked that there aren't other open pull requests for the same manifest update/change
+- [x] This PR only modifies one (1) manifest
+- [x] Validated manifest locally with ``winget validate --manifest <path>``
+- [x] Tested manifest locally with ``winget install --manifest <path>``
+- [x] Manifest conforms to the 1.28 schema
+"@
+}
+
+function New-UpstreamPr {
+    param([string]$Id, [string]$Version, [string]$RelPath, $Specs)
+
+    $branch = "bump/$Id/$Version"
+    $msg = "New version: $Id version $Version"
+    $fork = Get-ForkRepo
+    $owner = $fork.Split('/')[0]
+
+    # 读操作用普通 token 即可（没配 GH_TOKEN 时也能演练）
+    $upSha = (Get-Json "https://api.github.com/repos/$($script:Upstream)/git/ref/heads/master").object.sha
+    Write-Dim "上游 master = $($upSha.Substring(0,8))"
+
+    if ($DryRun) {
+        Write-Dim "DryRun：本该在 $fork 建 $branch（父 $($upSha.Substring(0,8))）并向上游开 PR"
+        return
+    }
+
+    # 上一次残留的同名分支先删掉，否则建不了
+    try { Invoke-GhApi DELETE "/repos/$fork/git/refs/heads/$branch" | Out-Null } catch { }
+    Invoke-GhApi POST "/repos/$fork/git/refs" @{ ref = "refs/heads/$branch"; sha = $upSha } | Out-Null
+    Write-Ok "分支已建：$branch（直接基于上游 master，天然不含 .github 改动）"
+
+    $dir = Join-Path $RepoRoot "$RelPath/$Version"
+    foreach ($f in (Get-ChildItem -LiteralPath $dir -File)) {
+        $path = "$RelPath/$Version/$($f.Name)"
+        Invoke-GhApi PUT "/repos/$fork/contents/$path" @{
+            message = $msg
+            content = [Convert]::ToBase64String([IO.File]::ReadAllBytes($f.FullName))
+            branch  = $branch
+        } | Out-Null
+        Write-Dim "  提交 $($f.Name)"
+    }
+
+    $pr = Invoke-GhApi POST "/repos/$($script:Upstream)/pulls" @{
+        title = $msg
+        head  = "${owner}:$branch"
+        base  = 'master'
+        body  = (New-PrBody $Id $Version $Specs)
+    }
+    Write-Ok "PR 已创建：$($pr.html_url)"
+}
+
 # ---------------------------------------------------------------- 主流程
 
 $packages = @(
@@ -367,7 +486,53 @@ foreach ($b in $bumped) {
     Write-Ok "已提交：$msg"
 }
 
+# ---------------------------------------------------------------- 向上游开 PR
+
+$prOpened = @()
+if ($OpenPr) {
+    Write-Head '向上游开 PR'
+    if (-not $env:GH_TOKEN -and -not $DryRun) {
+        Write-Warn2 '没有 GH_TOKEN：跳过自动开 PR（在仓库 Secrets 里加 GH_TOKEN 即可）'
+    } else {
+        foreach ($pkg in $packages) {
+            if ($Only -and $Only -ne $pkg.Id) { continue }
+            try {
+                $repoVers = @(Get-RepoVersions $pkg.Id)
+                if (-not $repoVers) { continue }
+                $ver = $repoVers[-1]
+
+                if (Test-UpstreamHasVersion $pkg.Id $ver) { Write-Dim "$($pkg.Id) $ver 上游已有，跳过"; continue }
+                $open = Get-OpenPrCount $pkg.Id $ver
+                if ($open -gt 0) { Write-Dim "$($pkg.Id) $ver 已有开着的 PR，跳过"; continue }
+
+                # 安装项只用于写 PR 正文里的 URL 列表
+                $specs = @()
+                $p = Get-IdParts $pkg.Id
+                $instDir = Join-Path $RepoRoot "$($p.RelPath)/$ver"
+                $instFile = Get-ChildItem -LiteralPath $instDir -Filter '*.installer.yaml' | Select-Object -First 1
+                if ($instFile) {
+                    $arch = ''; $scope = ''
+                    foreach ($line in (Get-Content -LiteralPath $instFile.FullName)) {
+                        if ($line -match '^-\s*Architecture:/s*(/S+)') { $arch = $matches[1] }
+                        elseif ($line -match '^(\s+)Scope:/s*(/S+)') { $scope = $matches[2] }
+                        elseif ($line -match '^\s*InstallerUrl:/s*(/S+)') {
+                            $specs += [pscustomobject]@{ Arch = $arch; Scope = $scope; Url = $matches[1] }
+                        }
+                    }
+                }
+
+                New-UpstreamPr -Id $pkg.Id -Version $ver -RelPath $p.RelPath -Specs $specs
+                $prOpened += "$($pkg.Id) $ver"
+            } catch {
+                Write-Warn2 "开 PR 失败（$($pkg.Id)）：$($_.Exception.Message)"
+                $script:failed = $true
+            }
+        }
+    }
+}
+
 Write-Head '汇总'
 Write-Host "  更新 $(@($bumped).Count) 个包：$((@($bumped) | ForEach-Object { "$($_.Id) $($_.Version)" }) -join '，')"
+if ($prOpened.Count) { Write-Host "  开 PR：$($prOpened -join '，')" }
 if ($script:failed) { exit 1 }
 exit 0
