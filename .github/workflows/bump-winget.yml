@@ -1,0 +1,49 @@
+# 只跟两个包的 winget 清单：Microsoft.VisualStudioCode（stable）和 DeepSeek.DeepSeekHarnessDesktop
+# 每小时跑一次；有新版本就生成清单 → winget validate → 提交 → 推送到 master
+#
+# 手动触发：Actions → bump winget manifests → Run workflow
+# 首次使用：fork 仓库的 Actions 默认是关的，需要在 Actions 页点一次 "I understand my workflows, go ahead and enable them"
+
+name: bump winget manifests
+
+on:
+  schedule:
+    - cron: '17 * * * *'        # UTC 每小时 17 分（整点排队最挤）
+  workflow_dispatch:
+
+permissions:
+  contents: write               # 用 GITHUB_TOKEN 提交并推送
+
+concurrency:
+  group: bump-winget
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出（只取两个包的目录，不拉整个仓库）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            manifests/m/Microsoft/VisualStudioCode
+            manifests/d/DeepSeek/DeepSeekHarnessDesktop
+
+      - name: 探测新版本并生成清单
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "zhoubo"
+          git config user.email "118490829+zhou-dev-design@users.noreply.github.com"
+          ./.github/scripts/bump-winget.ps1
+
+      - name: 推送到 master
+        shell: pwsh
+        run: |
+          git log --oneline -3
+          git push
