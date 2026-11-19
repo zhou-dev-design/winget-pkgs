@@ -48,7 +48,12 @@ jobs:
           git config user.name  "zhoubo"
           git config user.email "118490829+zhou-dev-design@users.noreply.github.com"
           $argv = @()
-          if ($env:GH_TOKEN) { $argv += '-OpenPr' } else { Write-Host '未配置 GH_TOKEN：只推分支、不开 PR' }
+          if ($env:GH_TOKEN) {
+            Write-Host "GH_TOKEN 已配置（长度 $($env:GH_TOKEN.Length)），本轮会向上游开 PR"
+            $argv += '-OpenPr'
+          } else {
+            Write-Host '::warning title=GH_TOKEN 未配置::只更新自己 fork 的 master，不会向上游开 PR。Settings → Secrets and variables → Actions 加一个名为 GH_TOKEN 的 classic PAT（勾 public_repo）'
+          }
           ./.github/scripts/bump-winget.ps1 @argv
 
       - name: 推送到 master

@@ -493,6 +493,11 @@ if ($OpenPr) {
     Write-Head '向上游开 PR'
     if (-not $env:GH_TOKEN -and -not $DryRun) {
         Write-Warn2 '没有 GH_TOKEN：跳过自动开 PR（在仓库 Secrets 里加 GH_TOKEN 即可）'
+        # 让它出现在 Actions 的"说明"面板里，而不是埋在日志深处
+        Write-Host '::warning title=GH_TOKEN 未配置::去 Settings → Secrets and variables → Actions 加一个名为 GH_TOKEN 的 secret（classic PAT，勾 public_repo），然后重新运行'
+    } elseif ($env:GH_TOKEN -and $env:GH_TOKEN.StartsWith('github_pat_')) {
+        Write-Warn2 'GH_TOKEN 是 fine-grained token，不能向上游开 PR'
+        Write-Host '::warning title=GH_TOKEN 类型不对::fine-grained token 无法向「你不是成员的公共仓库」提交；请换成 classic PAT 并勾 public_repo'
     } else {
         foreach ($pkg in $packages) {
             if ($Only -and $Only -ne $pkg.Id) { continue }
@@ -513,9 +518,9 @@ if ($OpenPr) {
                 if ($instFile) {
                     $arch = ''; $scope = ''
                     foreach ($line in (Get-Content -LiteralPath $instFile.FullName)) {
-                        if ($line -match '^-\s*Architecture:/s*(/S+)') { $arch = $matches[1] }
-                        elseif ($line -match '^(\s+)Scope:/s*(/S+)') { $scope = $matches[2] }
-                        elseif ($line -match '^\s*InstallerUrl:/s*(/S+)') {
+                        if ($line -match '^-\s*Architecture:\s*(\S+)') { $arch = $matches[1] }
+                        elseif ($line -match '^(\s+)Scope:\s*(\S+)') { $scope = $matches[2] }
+                        elseif ($line -match '^\s*InstallerUrl:\s*(\S+)') {
                             $specs += [pscustomobject]@{ Arch = $arch; Scope = $scope; Url = $matches[1] }
                         }
                     }
